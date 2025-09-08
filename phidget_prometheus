@@ -1,3 +1,468 @@
 #! /usr/bin/env python3
 """Collects data from phidget sensors
 and exposes it in a prometheus compatible way"""
+
+# %% IMPORTS
+# - python standard libraries
+import argparse
+import os
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+import random
+from pathlib import Path
+
+# -- prometheus
+from prometheus_client import start_http_server, Gauge, Enum, Info
+
+# - phidgets management
+from Phidget22.Devices.TemperatureSensor import TemperatureSensor
+from Phidget22.Devices.VoltageInput import VoltageInput, VoltageRange
+from Phidget22.Devices.LCD import LCD, LCDFont
+
+# - for configuration management
+import yaml
+
+# %% GLOBAL VARIABLES
+VERSION = "0.1"
+NAME = "phidget prometheus server"
+ROOT = Path(os.path.dirname(__file__))
+GLOBAL_TAGS = None
+CONFIG_FILE_PATH = None
+LOG_FILE_PATH = None
+CONFIG = {}
+METRICS = {}
+TEMP_SENSORS = []
+PRESSURE_GAUGES = []
+
+# %% LCD DISPLAY (opt)
+
+LCD_STRINGS = []
+LCD_MODEL_TEMP = "{name:<5}:{value:.1f}{unit}"
+LCD_MODEL_PRESSURE = "{name:<5}:{value:.1e}{unit}"
+LCD_HANDLER = LCD()
+LCD_SPINNER_SEQ = ["-", "\\", "|", "/"]
+LCD_SPINNER_STATE = 0
+
+
+# %% LOGGER
+# setup format
+fmt = "[%(asctime)s] - %(name)s - %(levelname)s - %(message)s"
+# config : default level set to INFO
+logging.basicConfig(format=fmt, datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# %% GAUGE API (FIXME: to move outside at some point)
+
+# voltage to pressure conversion functions
+
+
+def _Pfeiffer_IKR270(U):
+    """
+    Compact Cold Cathode Gauge IKR270
+    input  : U = voltage (in Volts)
+    output : P = pressuer (in mbar)
+    """
+    d = 12.75
+    P = 10 ** (1.25 * U - d)
+    return P
+
+
+def _Pfeiffer_PKR251(U):
+    """
+    Compact FullRange Gauge
+    input  : U = voltage (in Volts)
+    output : P = pressuer (in mbar)
+    """
+    d = 11.33
+    P = 10 ** (1.667 * U - d)
+    return P
+
+
+def _Gamma_Vac_SPC(U, offset=12):
+    """
+    Gamma Vacuum SPC ion pump controler
+    When monitoring set to "logarithmic pressure"
+    Offset value depends on selected range (on SPC)
+    input  : U = voltage (in Volts)
+    output : P = pressuer (in mbar)
+    """
+    P = 10 ** (U - offset)
+    return P
+
+
+GAUGE_MODELS = {
+    "IKR270": _Pfeiffer_IKR270,
+    "PKR251": _Pfeiffer_PKR251,
+    "GammaSPC": _Gamma_Vac_SPC,
+}
+
+
+# %% FUNCTIONS
+
+
+def file_path(string):
+    if os.path.isfile(string):
+        return Path(string)
+    else:
+        raise FileNotFoundError(string)
+
+
+def load_config():
+    global CONFIG_FILE_PATH, CONFIG, GLOBAL_TAGS
+    # logger
+    logger = logging.getLogger(__name__)
+    logger.debug(f"loading config file {CONFIG_FILE_PATH}")
+    # load config
+    with CONFIG_FILE_PATH.open() as file:
+        CONFIG = yaml.safe_load(file)
+    # get global tags
+    GLOBAL_TAGS = CONFIG["global"]["tags"]
+
+
+def setup_prometheus_server():
+    global CONFIG, NAME, VERSION, METRICS
+    # logger
+    logger = logging.getLogger(__name__)
+    logger.debug(f"starting prometheus serveur")
+    # start server
+    port = CONFIG["global"]["http_server_port"]
+    start_http_server(port)
+    # generic info
+    i = Info(
+        name="program_information",
+        documentation="Generic information on data collection program",
+        labelnames=list(GLOBAL_TAGS.keys()),
+    )
+    i.labels(**GLOBAL_TAGS).info({"name": NAME, "version": VERSION})
+    # global config
+    scrap_interval = Gauge(
+        name="scrap_interval",
+        documentation="interval for data scrapping on the data collection side",
+        unit="seconds",
+        labelnames=list(GLOBAL_TAGS.keys()),
+    )
+    scrap_interval.labels(**GLOBAL_TAGS).set(float(CONFIG["global"]["scrap_interval"]))
+    # status
+    status = Enum(
+        name="scrapper_status",
+        documentation="status of the data collection program",
+        labelnames=list(GLOBAL_TAGS.keys()),
+        states=["starting", "running", "error"],
+    )
+    status.labels(**GLOBAL_TAGS).state("starting")
+    METRICS["status"] = status
+
+
+def setup_LCD():
+    global CONFIG, LCD_HANDLER
+    if CONFIG["global"]["lcd"]:
+        LCD_HANDLER.openWaitForAttachment(1000)
+        LCD_HANDLER.setBacklight(0.2)
+
+
+def setup_metrics():
+    global METRICS, CONFIG, GLOBAL_TAGS
+    # labels
+    labels = list(GLOBAL_TAGS.keys()) + ["location", "device", "device_serial_number"]
+    # name prefix
+    prefix = CONFIG["global"].get("name_prefix", "")
+    # temperature
+    temperature = Gauge(
+        name=f"{prefix}temperature",
+        documentation="Temperature from phidget sensors",
+        unit="celsius",
+        labelnames=labels,
+    )
+    METRICS["temperature"] = temperature
+    # pressure
+    pressure = Gauge(
+        name=f"{prefix}pressure",
+        documentation="Pressure from phidget sensors (converted from voltage)",
+        unit="millibar",
+        labelnames=labels,
+    )
+    METRICS["pressure"] = pressure
+    # voltage
+    voltage = Gauge(
+        name=f"{prefix}voltage",
+        documentation="Voltage from phidget sensors",
+        unit="volt",
+        labelnames=labels,
+    )
+    METRICS["voltage"] = voltage
+
+
+def setup_temperature_sensors():
+    global CONFIG, TEMP_SENSORS
+    # - get logger
+    logger = logging.getLogger(__name__)
+    # - loop on temperature sensors
+    for conf in CONFIG["temperature sensors"]:
+        try:
+            # initial checkup
+            if not conf["enabled"]:
+                continue
+            # emulated ?
+            conf["emulated"] = False if "emulated" not in conf else conf["emulated"]
+            conf["em_str"] = "**emulated**" if conf["emulated"] else ""
+            # logger
+            logger.debug(
+                "add {em_str} temperature sensor > port : {port} | chan : {channel} | loc : {location}".format(
+                    **conf
+                )
+            )
+            # init
+            ts = TemperatureSensor()
+            ts.setHubPort(conf["port"])
+            ts.setChannel(conf["channel"])
+            ts.emulated = conf["emulated"]
+            if not ts.emulated:
+                ts.openWaitForAttachment(1000)
+            else:
+                ts.temperature = (
+                    20.0  # initial fake temperature for "realistic" fake data
+                )
+            ts.tags = {
+                "location": conf["location"],
+                "device": "phidget",
+                "device_serial_number": ts.getDeviceSerialNumber(),
+            }
+            ts.display_name = conf["display name"]
+            ts.display_unit = "C"
+            ts.alarm = conf["alarm"]
+            ts.min = conf["min"]
+            ts.max = conf["max"]
+            # append to list
+            TEMP_SENSORS.append(ts)
+        except Exception as e:
+            logger.error(e)
+
+
+def setup_pressure_gauges():
+    global CONFIG, PRESSURE_GAUGES, GAUGE_MODELS
+    # - get logger
+    logger = logging.getLogger(__name__)
+    # - loop on temperature sensors
+    for conf in CONFIG["pressure gauges"]:
+        try:
+            # initial checkup
+            if not conf["enabled"]:
+                continue
+            # logger
+            logger.debug(
+                "add pressure gauge > port : {port} | model : {model} | loc : {location}".format(
+                    **conf
+                )
+            )
+            # check that model is implemented
+            if conf["model"] not in GAUGE_MODELS.keys():
+                logger.error("gauge model {model} is not implemented".format(**conf))
+                continue
+            # init
+            pg = VoltageInput()
+            pg.setHubPort(conf["port"])
+            pg.tags = {
+                "location": conf["location"],
+                "device": "phidget",
+                "device_serial_number": pg.getDeviceSerialNumber(),
+            }
+            pg.display_name = conf["display name"]
+            pg.display_unit = "mbar"
+            pg.conversion_function = GAUGE_MODELS[conf["model"]]
+            pg.alarm = conf["alarm"]
+            pg.min = conf["min"]
+            pg.max = conf["max"]
+            pg.openWaitForAttachment(1000)
+            pg.setVoltageRange(VoltageRange.VOLTAGE_RANGE_40V)
+            # append to list
+            PRESSURE_GAUGES.append(pg)
+        except Exception as e:
+            logger.error(e)
+
+
+def start_monitoring():
+    global CONFIG, METRICS, GLOBAL_TAGS
+    # get logger
+    logger = logging.getLogger(__name__)
+    logger.debug("----------- START MONITORING -------------")
+    # get config
+    scrap_interval = CONFIG["global"]["scrap_interval"]
+    last_measurement = time.time()
+    # start monitoring
+    METRICS["status"].labels(**GLOBAL_TAGS).state("running")
+    while True:
+        # new measurement ?
+        if time.time() - last_measurement > scrap_interval:
+            last_measurement = time.time()
+            t0 = time.time()
+            _measure()
+            _update_LCD()
+            t1 = time.time()
+            logger.debug(f"measurement done in {t1-t0}s")
+        time.sleep(scrap_interval / 20)
+
+
+def _measure():
+    global TEMP_SENSORS, PRESSURE_GAUGES, LCD_STRINGS, LCD_MODEL_TEMP, LCD_MODEL_PRESSURE, CONFIG, METRICS
+    # get logger
+    logger = logging.getLogger(__name__)
+    METRICS["status"].labels(**GLOBAL_TAGS).state("running")
+    # current time
+    LCD_STRINGS = []
+
+    # ------ TEMPERATURE SENSORS ------
+    for ts in TEMP_SENSORS:
+        # - 1 - get temperature from phidget
+        new_temperature = -1
+        try:
+            if ts.emulated:
+                # for an emulated sensor, we have a random fluctation
+                dT = (random.random() - 0.5) / 3.0
+                ts.temperature += dT
+                new_temperature = ts.temperature
+            else:
+                # otherwise, we measure temperature
+                new_temperature = ts.getTemperature()
+        except Exception as e:
+            logger.error(e)
+            METRICS["status"].labels(**GLOBAL_TAGS).state("error")
+
+        # - 2 - update prometheus gauge value
+        tags = ts.tags
+        tags.update(GLOBAL_TAGS)
+        METRICS["temperature"].labels(**tags).set(new_temperature)
+
+        # - 3 - if applicable, update LCD
+        if CONFIG["global"]["lcd"]:
+            str = LCD_MODEL_TEMP.format(
+                name=ts.display_name, value=new_temperature, unit=ts.display_unit
+            )
+            if ts.alarm and (new_temperature < ts.min or new_temperature > ts.max):
+                if int(2 * time.time()) % 2:  # blinking
+                    str += "!"
+                else:
+                    str += " "
+            else:
+                str += " "
+            LCD_STRINGS.append(str)
+
+    # ------ PRESSURE SENSORS ------
+    # pressure gauges
+    # we start a new line on the LCD
+    if len(LCD_STRINGS) % 2:
+        LCD_STRINGS.append("")
+    LCD_STRINGS.append("-" * 100)
+    LCD_STRINGS.append("")
+
+    # get pressure values
+    for pg in PRESSURE_GAUGES:
+        # - 1 - get voltage from phidget
+        new_voltage = -1
+        new_pressure = -1
+        try:
+            new_voltage = pg.getVoltage()
+            new_pressure = pg.conversion_function(new_voltage)
+        except Exception as e:
+            logger.error(e)
+
+        # - 2 - update prometheus gauge value
+        tags = pg.tags
+        tags.update(GLOBAL_TAGS)
+        METRICS["pressure"].labels(**tags).set(new_pressure)
+        METRICS["voltage"].labels(**tags).set(new_voltage)
+
+        # - 3 - if applicable, update LCD
+        if CONFIG["global"]["lcd"]:
+            str = LCD_MODEL_PRESSURE.format(
+                name=pg.display_name, value=new_pressure, unit=pg.display_unit
+            )
+            if pg.alarm and (new_pressure < pg.min or new_pressure > pg.max):
+                if int(2 * time.time()) % 2:  # blinking
+                    str += "!"
+                else:
+                    str += " "
+            else:
+                str += " "
+            LCD_STRINGS.append(str)
+            LCD_STRINGS.append("")
+
+
+def _update_LCD():
+    global CONFIG, LCD_STRINGS, LCD_HANDLER, LCD_SPINNER_SEQ, LCD_SPINNER_STATE
+    if not CONFIG["global"]["lcd"]:
+        return
+    # Write data
+    line = 0
+    line_height = 8
+    line_width = 65
+    font = LCDFont.FONT_5x8
+    for str in LCD_STRINGS:
+        x = (line % 2) * line_width
+        y = (line // 2) * line_height
+        LCD_HANDLER.writeText(font, x, y, str)
+        line += 1
+
+    # Update spinner
+    spinner_str = LCD_SPINNER_SEQ[LCD_SPINNER_STATE % len(LCD_SPINNER_SEQ)]
+    LCD_SPINNER_STATE += 1
+    # screen size is 128 x 64, and one character is 5 x 8
+    # so position of down right corner is 128-5, 64-8
+    LCD_HANDLER.writeText(font, 128 - 5, 64 - 8, spinner_str)
+
+    # Flush
+    LCD_HANDLER.flush()
+
+
+# %% MAIN
+def main():
+    load_config()
+    setup_prometheus_server()
+    setup_LCD()
+    setup_metrics()
+    setup_temperature_sensors()
+    setup_pressure_gauges()
+    start_monitoring()
+
+
+# %% RUN
+if __name__ == "__main__":
+    # -- get arguments
+    # configure parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", type=file_path, help="config file path")
+    parser.add_argument("--debug", action="store_true", help="Start in debug mode")
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        help="file to write logs. If none is given, logs are not written.",
+    )
+    # process config argument
+    args = parser.parse_args()
+    conf_path = args.config
+    if conf_path is not None:
+        CONFIG_FILE_PATH = Path(conf_path)
+    else:
+        CONFIG_FILE_PATH = ROOT / "config.yml"
+
+    # -- handle logger
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("debug mode enabled")
+
+    if args.log_file is not None:
+        logger.info(f"logging to {args.log_file}")
+        handler = RotatingFileHandler(
+            args.log_file,  # Log file name
+            maxBytes=100000,  # Maximum size of a log file in bytes before rotation
+            backupCount=3,  # Number of backup files to keep
+        )
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    # -- start
+    logger.info("starting phidget prometheus server")
+    main()

@@ -1,0 +1,48 @@
+# global configuration attributes
+global:
+  tags:
+    room: room name
+    site: site name
+  scrap_interval: 0.5 # s
+  http_server_port: 8000
+  lcd: false
+  name_prefix: phidget_
+
+# list of temperature sensors
+# (phidgets)
+temperature sensors:
+  # emulated sensor (for tests)
+  - port: 0
+    channel: 0
+    location: dummy sensor
+    display name: DMY
+    alarm: false
+    max: 0
+    min: 500
+    enabled: true
+    emulated: true
+
+  # IP
+  - port: 0
+    channel: 0
+    location: ion pump
+    display name: IP
+    alarm: false
+    max: 0
+    min: 500
+    enabled: false
+
+
+# list of pressure gauges
+# (phidgets)
+pressure gauges:
+  # IP
+  - port: 2
+    location: pumping station
+    model: PKR251
+    display name: TMP
+    alarm: false
+    max: 1
+    min: 0
+    enabled: false
+
