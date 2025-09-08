@@ -164,7 +164,13 @@ def setup_LCD():
 def setup_metrics():
     global METRICS, CONFIG, GLOBAL_TAGS
     # labels
-    labels = list(GLOBAL_TAGS.keys()) + ["location", "device", "device_serial_number"]
+    labels = list(GLOBAL_TAGS.keys()) + [
+        "location",
+        "device",
+        "device_serial_number",
+        "channel",
+        "port",
+    ]
     # name prefix
     prefix = CONFIG["global"].get("name_prefix", "")
     # temperature
@@ -227,6 +233,8 @@ def setup_temperature_sensors():
                 "location": conf["location"],
                 "device": "phidget",
                 "device_serial_number": ts.getDeviceSerialNumber(),
+                "channel": conf["channel"],
+                "port": conf["port"]
             }
             ts.display_name = conf["display name"]
             ts.display_unit = "C"
@@ -266,6 +274,8 @@ def setup_pressure_gauges():
                 "location": conf["location"],
                 "device": "phidget",
                 "device_serial_number": pg.getDeviceSerialNumber(),
+                "channel": conf["channel"],
+                "port": conf["port"]
             }
             pg.display_name = conf["display name"]
             pg.display_unit = "mbar"
