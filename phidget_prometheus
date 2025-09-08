@@ -1,0 +1,3 @@
+#! /usr/bin/env python3
+"""Collects data from phidget sensors
+and exposes it in a prometheus compatible way"""
