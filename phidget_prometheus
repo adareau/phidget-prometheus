@@ -157,8 +157,11 @@ def setup_prometheus_server():
 def setup_LCD():
     global CONFIG, LCD_HANDLER
     if CONFIG["global"]["lcd"]:
-        LCD_HANDLER.openWaitForAttachment(1000)
-        LCD_HANDLER.setBacklight(0.2)
+        try:
+            LCD_HANDLER.openWaitForAttachment(1000)
+            LCD_HANDLER.setBacklight(0.2)
+        except Exception as e:
+            logger.error(e)
 
 
 def setup_metrics():
@@ -234,7 +237,7 @@ def setup_temperature_sensors():
                 "device": "phidget",
                 "device_serial_number": ts.getDeviceSerialNumber(),
                 "channel": conf["channel"],
-                "port": conf["port"]
+                "port": conf["port"],
             }
             ts.display_name = conf["display name"]
             ts.display_unit = "C"
@@ -275,7 +278,7 @@ def setup_pressure_gauges():
                 "device": "phidget",
                 "device_serial_number": pg.getDeviceSerialNumber(),
                 "channel": conf["channel"],
-                "port": conf["port"]
+                "port": conf["port"],
             }
             pg.display_name = conf["display name"]
             pg.display_unit = "mbar"
@@ -402,16 +405,19 @@ def _update_LCD():
     global CONFIG, LCD_STRINGS, LCD_HANDLER, LCD_SPINNER_SEQ, LCD_SPINNER_STATE
     if not CONFIG["global"]["lcd"]:
         return
-    # Write data
-    line = 0
-    line_height = 8
-    line_width = 65
-    font = LCDFont.FONT_5x8
-    for str in LCD_STRINGS:
-        x = (line % 2) * line_width
-        y = (line // 2) * line_height
-        LCD_HANDLER.writeText(font, x, y, str)
-        line += 1
+    try:
+        # Write data
+        line = 0
+        line_height = 8
+        line_width = 65
+        font = LCDFont.FONT_5x8
+        for str in LCD_STRINGS:
+            x = (line % 2) * line_width
+            y = (line // 2) * line_height
+            LCD_HANDLER.writeText(font, x, y, str)
+            line += 1
+    except Exception as e:
+        logger.error(e)
 
     # Update spinner
     spinner_str = LCD_SPINNER_SEQ[LCD_SPINNER_STATE % len(LCD_SPINNER_SEQ)]
