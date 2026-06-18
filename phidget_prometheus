@@ -17,6 +17,7 @@ from prometheus_client import start_http_server, Gauge, Enum, Info
 
 # - phidgets management
 from Phidget22.Devices.TemperatureSensor import TemperatureSensor
+from Phidget22.Devices.HumiditySensor import HumiditySensor
 from Phidget22.Devices.VoltageInput import VoltageInput, VoltageRange
 from Phidget22.Devices.LCD import LCD, LCDFont
 
@@ -33,12 +34,14 @@ LOG_FILE_PATH = None
 CONFIG = {}
 METRICS = {}
 TEMP_SENSORS = []
+HUM_SENSORS = []
 PRESSURE_GAUGES = []
 
 # %% LCD DISPLAY (opt)
 
 LCD_STRINGS = []
 LCD_MODEL_TEMP = "{name:<5}:{value:.1f}{unit}"
+LCD_MODEL_HUM = "{name:<5}:{value:.1f}{unit}"
 LCD_MODEL_PRESSURE = "{name:<5}:{value:.1e}{unit}"
 LCD_HANDLER = LCD()
 LCD_SPINNER_SEQ = ["-", "\\", "|", "/"]
@@ -184,6 +187,14 @@ def setup_metrics():
         labelnames=labels,
     )
     METRICS["temperature"] = temperature
+    # temperature
+    humidity = Gauge(
+        name=f"{prefix}humidity",
+        documentation="Humidity from phidget sensors",
+        unit="percent",
+        labelnames=labels,
+    )
+    METRICS["humidity"] = humidity
     # pressure
     pressure = Gauge(
         name=f"{prefix}pressure",
@@ -246,6 +257,52 @@ def setup_temperature_sensors():
             ts.max = conf["max"]
             # append to list
             TEMP_SENSORS.append(ts)
+        except Exception as e:
+            logger.error(e)
+
+
+def setup_humidity_sensors():
+    global CONFIG, HUM_SENSORS
+    # - get logger
+    logger = logging.getLogger(__name__)
+    # - loop on humidity sensors
+    for conf in CONFIG["humidity sensors"]:
+        try:
+            # initial checkup
+            if not conf["enabled"]:
+                continue
+            # emulated ?
+            conf["emulated"] = False if "emulated" not in conf else conf["emulated"]
+            conf["em_str"] = "**emulated**" if conf["emulated"] else ""
+            # logger
+            logger.debug(
+                "add {em_str} humidity sensor > port : {port} | chan : {channel} | loc : {location}".format(
+                    **conf
+                )
+            )
+            # init
+            hs = HumiditySensor()
+            hs.setHubPort(conf["port"])
+            hs.setChannel(conf["channel"])
+            hs.emulated = conf["emulated"]
+            if not hs.emulated:
+                hs.openWaitForAttachment(1000)
+            else:
+                hs.humidity = 50.0  # initial fake humidity for "realistic" fake data
+            hs.tags = {
+                "location": conf["location"],
+                "device": "phidget",
+                "device_serial_number": hs.getDeviceSerialNumber(),
+                "channel": conf["channel"],
+                "port": conf["port"],
+            }
+            hs.display_name = conf["display name"]
+            hs.display_unit = "%"
+            hs.alarm = conf["alarm"]
+            hs.min = conf["min"]
+            hs.max = conf["max"]
+            # append to list
+            HUM_SENSORS.append(hs)
         except Exception as e:
             logger.error(e)
 
@@ -317,7 +374,7 @@ def start_monitoring():
 
 
 def _measure():
-    global TEMP_SENSORS, PRESSURE_GAUGES, LCD_STRINGS, LCD_MODEL_TEMP, LCD_MODEL_PRESSURE, CONFIG, METRICS
+    global TEMP_SENSORS, HUM_SENSORS, PRESSURE_GAUGES, LCD_STRINGS, LCD_MODEL_TEMP, LCD_MODEL_PRESSURE, CONFIG, METRICS
     # get logger
     logger = logging.getLogger(__name__)
     METRICS["status"].labels(**GLOBAL_TAGS).state("running")
@@ -352,6 +409,42 @@ def _measure():
                 name=ts.display_name, value=new_temperature, unit=ts.display_unit
             )
             if ts.alarm and (new_temperature < ts.min or new_temperature > ts.max):
+                if int(2 * time.time()) % 2:  # blinking
+                    str += "!"
+                else:
+                    str += " "
+            else:
+                str += " "
+            LCD_STRINGS.append(str)
+
+    # ------ HUMIDITY SENSORS ------
+    for hs in HUM_SENSORS:
+        # - 1 - get temperature from phidget
+        new_humidity = -1
+        try:
+            if hs.emulated:
+                # for an emulated sensor, we have a random fluctation
+                dH = (random.random() - 0.5) / 3.0
+                hs.humidity += dH
+                new_humidity = hs.humidity
+            else:
+                # otherwise, we measure temperature
+                new_humidity = hs.getHumidity()
+        except Exception as e:
+            logger.error(e)
+            METRICS["status"].labels(**GLOBAL_TAGS).state("error")
+
+        # - 2 - update prometheus gauge value
+        tags = hs.tags
+        tags.update(GLOBAL_TAGS)
+        METRICS["humidity"].labels(**tags).set(new_humidity)
+
+        # - 3 - if applicable, update LCD
+        if CONFIG["global"]["lcd"]:
+            str = LCD_MODEL_HUM.format(
+                name=hs.display_name, value=new_humidity, unit=hs.display_unit
+            )
+            if hs.alarm and (new_humidity < hs.min or new_humidity > hs.max):
                 if int(2 * time.time()) % 2:  # blinking
                     str += "!"
                 else:

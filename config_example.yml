@@ -33,6 +33,20 @@ temperature sensors:
     enabled: false
 
 
+# list of humidity sensors
+# (phidgets)
+humidity sensors:
+
+  # IP
+  - port: 0
+    channel: 0
+    location: pool
+    display name: IP
+    alarm: false
+    max: 0
+    min: 500
+    enabled: false
+
 # list of pressure gauges
 # (phidgets)
 pressure gauges:
